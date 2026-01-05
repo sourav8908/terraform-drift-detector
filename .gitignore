@@ -1,0 +1,7 @@
+@"
+.terraform/
+terraform-test/.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+"@ | Out-File -FilePath ".gitignore" -Encoding UTF8
