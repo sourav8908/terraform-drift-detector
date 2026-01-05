@@ -1,0 +1,207 @@
+name: Terraform Drift Detection
+
+on:
+  # Run on every push to main
+  push:
+    branches: [ main ]
+  
+  # Run on every PR
+  pull_request:
+    branches: [ main ]
+  
+  # Run daily at 9 AM UTC
+  schedule:
+    - cron: '0 9 * * *'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  drift-check:
+    name: Check Terraform Drift
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      
+      - name: Run drift detection
+        id: drift
+        continue-on-error: true
+        run: |
+          # Run drift detector
+          python main.py terraform.tfstate --output drift_report.html > drift_output.txt 2>&1
+          
+          # Capture exit code
+          DRIFT_EXIT_CODE=$?
+          echo "exit_code=$DRIFT_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # Save output
+          cat drift_output.txt
+          
+          # Check if drift detected
+          if [ $DRIFT_EXIT_CODE -eq 1 ]; then
+            echo "drift_detected=true" >> $GITHUB_OUTPUT
+          else
+            echo "drift_detected=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Upload drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report-${{ github.run_number }}
+          path: |
+            drift_report.html
+            terraform_fixes.tf
+            drift_output.txt
+          retention-days: 30
+      
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && steps.drift.outputs.drift_detected == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read fix summary
+            let fixContent = '';
+            try {
+              const fullContent = fs.readFileSync('terraform_fixes.tf', 'utf8');
+              // Extract only important parts (first 1000 chars)
+              const lines = fullContent.split('\n');
+              
+              // Get summary and first resource
+              let summaryLines = [];
+              let inResource = false;
+              let resourceLines = [];
+              
+              for (const line of lines) {
+                if (line.includes('# Total fixes needed:')) {
+                  summaryLines.push(line);
+                } else if (line.includes('## CRITICAL') || line.includes('## HIGH') || line.includes('## MEDIUM')) {
+                  summaryLines.push(line);
+                } else if (line.includes('# Resource:')) {
+                  inResource = true;
+                  resourceLines.push(line);
+                } else if (inResource && resourceLines.length < 20) {
+                  resourceLines.push(line);
+                  if (line.includes('# Manual steps:')) {
+                    break;
+                  }
+                }
+              }
+              
+              fixContent = summaryLines.join('\n') + '\n\n' + resourceLines.slice(0, 25).join('\n');
+              if (resourceLines.length > 25) {
+                fixContent += '\n... (see full report in artifacts)';
+              }
+            } catch (e) {
+              fixContent = 'Could not read fix file';
+            }
+            
+            // Read drift summary from output
+            let driftSummary = '';
+            try {
+              const fullOutput = fs.readFileSync('drift_output.txt', 'utf8');
+              const lines = fullOutput.split('\n');
+              
+              // Find summary section
+              let inSummary = false;
+              for (let i = 0; i < lines.length; i++) {
+                if (lines[i].includes('DRIFT ANALYSIS SUMMARY')) {
+                  inSummary = true;
+                  continue;
+                }
+                if (inSummary) {
+                  if (lines[i].includes('===')) {
+                    continue;
+                  }
+                  if (lines[i].includes('⚠️  Drift detected')) {
+                    break;
+                  }
+                  driftSummary += lines[i] + '\n';
+                }
+              }
+            } catch (e) {
+              driftSummary = 'Could not read drift summary';
+            }
+            
+            const comment = `## 🚨 Terraform Drift Detected!
+            
+            **⚠️ Configuration drift found between Terraform state and AWS infrastructure.**
+            
+            ### Summary
+            \`\`\`
+            ${driftSummary.trim()}
+            \`\`\`
+            
+            ### Auto-Generated Fixes
+            \`\`\`hcl
+            ${fixContent}
+            \`\`\`
+            
+            ### 📥 Download Full Report
+            - Go to **Actions** tab → This workflow run
+            - Download **drift-report-${context.runNumber}** artifact
+            - Open \`drift_report.html\` for detailed analysis
+            - Review \`terraform_fixes.tf\` for complete fix code
+            
+            ### 🔧 Next Steps
+            1. Review the drift report and fix suggestions
+            2. Update your \`.tf\` files with suggested changes
+            3. Run \`terraform plan\` to verify changes
+            4. Run \`terraform apply\` to fix drift
+            
+            ---
+            *🤖 Generated by Terraform Drift Detector*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+      
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Drift Detection Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.drift.outputs.drift_detected }}" == "true" ]; then
+            echo "⚠️ **Drift Detected!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Download the \`drift-report-${{ github.run_number }}\` artifact for details." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **No Drift Detected**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "All resources match Terraform state." >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Fail workflow if critical drift
+        if: steps.drift.outputs.drift_detected == 'true'
+        run: |
+          echo "::error::Terraform drift detected! Review the drift report."
+          exit 1
